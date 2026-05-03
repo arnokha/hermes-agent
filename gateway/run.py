@@ -962,7 +962,7 @@ class GatewayRunner:
     # Class-level defaults so partial construction in tests doesn't
     # blow up on attribute access.
     _running_agents_ts: Dict[str, float] = {}
-    _busy_input_mode: str = "interrupt"
+    _busy_input_mode: str = "queue"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _exit_code: Optional[int] = None
     _draining: bool = False
@@ -1934,7 +1934,9 @@ class GatewayRunner:
             return "queue"
         if mode == "steer":
             return "steer"
-        return "interrupt"
+        if mode == "interrupt":
+            return "interrupt"
+        return "queue"
 
     @staticmethod
     def _load_restart_drain_timeout() -> float:
@@ -2114,22 +2116,49 @@ class GatewayRunner:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
 
+        interrupt_command_prompt = ""
+        if event.get_command() == "interrupt":
+            interrupt_command_prompt = event.get_command_args().strip()
+            if not interrupt_command_prompt:
+                thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                try:
+                    await adapter._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content="Usage: /interrupt <prompt>",
+                        reply_to=event.message_id,
+                        metadata=thread_meta,
+                    )
+                except Exception as e:
+                    logger.debug("Failed to send /interrupt usage: %s", e)
+                return True
+            effective_mode = "interrupt"
+
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
         if not steered:
-            merge_pending_message_event(adapter._pending_messages, session_key, event)
+            pending_event = event
+            if interrupt_command_prompt:
+                pending_event = MessageEvent(
+                    text=interrupt_command_prompt,
+                    message_type=event.message_type,
+                    source=event.source,
+                    message_id=event.message_id,
+                    channel_prompt=event.channel_prompt,
+                    attachments=event.attachments,
+                )
+            merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
 
-        # If not in queue/steer mode, interrupt the running agent immediately.
+        # If explicitly interrupting, interrupt the running agent immediately.
         # This aborts in-flight tool calls and causes the agent loop to exit
         # at the next check point.
         if effective_mode == "interrupt" and running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             try:
-                running_agent.interrupt(event.text)
+                running_agent.interrupt(interrupt_command_prompt or event.text)
             except Exception:
                 pass  # don't let interrupt failure block the ack
 
@@ -4740,8 +4769,8 @@ class GatewayRunner:
             _slash_confirm_mod.clear_if_stale(_quick_key)
 
         # PRIORITY handling when an agent is already running for this session.
-        # Default behavior is to interrupt immediately so user text/stop messages
-        # are handled with minimal latency.
+        # Default behavior is to queue user text so active work can finish.
+        # /interrupt is the explicit exception for urgent follow-ups.
         #
         # Special case: Telegram/photo bursts often arrive as multiple near-
         # simultaneous updates. Do NOT interrupt for photo-only follow-ups here;
@@ -4870,6 +4899,35 @@ class GatewayRunner:
                 if depth <= 1:
                     return "Queued for the next turn."
                 return f"Queued for the next turn. ({depth} queued)"
+
+            # /interrupt <prompt> — explicit exception to default queueing.
+            # Interrupt the active agent and replay only the prompt text
+            # (not the literal slash command) as the next user turn.
+            if _cmd_def_inner and _cmd_def_inner.name == "interrupt":
+                interrupt_text = event.get_command_args().strip()
+                if not interrupt_text:
+                    return "Usage: /interrupt <prompt>"
+                running_agent = self._running_agents.get(_quick_key)
+                if running_agent is _AGENT_PENDING_SENTINEL:
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        queued_event = MessageEvent(
+                            text=interrupt_text,
+                            message_type=MessageType.TEXT,
+                            source=event.source,
+                            message_id=event.message_id,
+                            channel_prompt=event.channel_prompt,
+                            attachments=event.attachments,
+                        )
+                        merge_pending_message_event(adapter._pending_messages, _quick_key, queued_event)
+                    return "Agent still starting — queued for the next turn."
+                if running_agent:
+                    running_agent.interrupt(interrupt_text)
+                if _quick_key in self._pending_messages:
+                    self._pending_messages[_quick_key] += "\n" + interrupt_text
+                else:
+                    self._pending_messages[_quick_key] = interrupt_text
+                return None
 
             # /steer <prompt> — inject mid-run after the next tool call.
             # Unlike /queue (turn boundary), /steer lands BETWEEN tool-call

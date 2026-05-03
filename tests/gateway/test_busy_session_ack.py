@@ -94,19 +94,28 @@ def _make_adapter(platform_val="telegram"):
 class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
 
+    def test_load_busy_input_mode_defaults_to_queue(self, monkeypatch, tmp_path):
+        """When config/env do not opt in otherwise, busy follow-ups queue by default."""
+        import gateway.run as _gr
+        from gateway.run import GatewayRunner
+
+        monkeypatch.delenv("HERMES_GATEWAY_BUSY_INPUT_MODE", raising=False)
+        monkeypatch.setattr(_gr, "_hermes_home", tmp_path)
+
+        assert GatewayRunner._load_busy_input_mode() == "queue"
+
     @pytest.mark.asyncio
-    async def test_handle_message_queue_mode_queues_without_interrupt(self):
-        """Runner queue mode must not interrupt an active agent for text follow-ups."""
+    async def test_handle_message_default_queues_without_interrupt(self):
+        """Default busy behavior queues an active-session text follow-up."""
         from gateway.run import GatewayRunner
 
         runner, _sentinel = _make_runner()
         adapter = _make_adapter()
 
-        event = _make_event(text="follow up in queue mode")
+        event = _make_event(text="follow up in default mode")
         sk = build_session_key(event.source)
 
         running_agent = MagicMock()
-        runner._busy_input_mode = "queue"
         runner._running_agents[sk] = running_agent
         runner.adapters[event.source.platform] = adapter
 
@@ -117,6 +126,28 @@ class TestBusySessionAck:
         assert adapter._pending_messages[sk] is event
         assert sk not in runner._pending_messages
         running_agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_interrupt_slash_command_interrupts_and_replays_prompt(self):
+        """/interrupt is the explicit exception to default queueing."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter()
+
+        event = _make_event(text="/interrupt stop and answer this now")
+        sk = build_session_key(event.source)
+
+        running_agent = MagicMock()
+        runner._running_agents[sk] = running_agent
+        runner.adapters[event.source.platform] = adapter
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        running_agent.interrupt.assert_called_once_with("stop and answer this now")
+        assert runner._pending_messages[sk] == "stop and answer this now"
+        assert sk not in adapter._pending_messages
 
     @pytest.mark.asyncio
     async def test_sends_ack_when_agent_running(self):
@@ -549,6 +580,7 @@ class TestBusySessionOnboardingHint:
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
         assert "Queued for the next turn" in content
         assert "First-time tip" in content
-        assert "/busy interrupt" in content
-        # Must NOT tell the user to /busy queue when they're already on queue.
+        assert "/interrupt <prompt>" in content
+        # Must NOT tell the user to switch modes just to get a one-off interrupt.
+        assert "/busy interrupt" not in content
         assert "/busy queue" not in content
